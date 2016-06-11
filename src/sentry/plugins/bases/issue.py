@@ -37,6 +37,8 @@ class IssueTrackingPlugin(Plugin):
     not_configured_template = 'sentry/plugins/bases/issue/not_configured.html'
     needs_auth_template = 'sentry/plugins/bases/issue/needs_auth.html'
     auth_provider = None
+    can_unlink_issues = False
+    can_link_existing_issues = False
 
     def _get_group_body(self, request, group, event, **kwargs):
         result = []
@@ -99,6 +101,12 @@ class IssueTrackingPlugin(Plugin):
         """
         return 'Create %s Issue' % self.get_title()
 
+    def get_unlink_issue_title(self, **kwargs):
+        """
+        Return a string for the "Unlink plugin issue" action label.
+        """
+        return 'Unlink %s Issue' % self.get_title()
+
     def get_new_issue_form(self, request, group, event, **kwargs):
         """
         Return a Form for the "Create new issue" page.
@@ -111,6 +119,9 @@ class IssueTrackingPlugin(Plugin):
         know when filing the issue.
         """
         return []
+
+    def get_link_existing_issue_form(self, request, group, event, **kwargs):
+        raise NotImplementedError
 
     def get_issue_url(self, group, issue_id, **kwargs):
         """
@@ -145,6 +156,10 @@ class IssueTrackingPlugin(Plugin):
 
         return self.auth_provider in get_auth_providers()
 
+    def handle_unlink_issue(self, request, group, **kwargs):
+        GroupMeta.objects.unset_value(group, '%s:tid' % self.get_conf_key())
+        return self.redirect(group.get_absolute_url())
+
     def view(self, request, group, **kwargs):
         has_auth_configured = self.has_auth_configured()
         if not (has_auth_configured and self.is_configured(project=group.project, request=request)):
@@ -167,47 +182,81 @@ class IssueTrackingPlugin(Plugin):
             })
 
         if GroupMeta.objects.get_value(group, '%s:tid' % self.get_conf_key(), None):
+            if self.can_unlink_issues:
+                return self.handle_unlink_issue(request, group, **kwargs)
             return None
 
         prefix = self.get_conf_key()
         event = group.get_latest_event()
         Event.objects.bind_nodes([event], 'data')
 
-        form = self.get_new_issue_form(request, group, event)
-        if form.is_valid():
-            try:
-                issue_id = self.create_issue(
+        op = request.POST.get('op', 'create')
+
+        create_form = self.get_new_issue_form(request, group, event)
+        link_form = None
+        if self.can_link_existing_issues:
+            link_form = self.get_link_existing_issue_form(request, group, event)
+
+        if op == 'create':
+            if create_form.is_valid():
+                try:
+                    issue_id = self.create_issue(
+                        group=group,
+                        form_data=create_form.cleaned_data,
+                        request=request,
+                    )
+                except forms.ValidationError as e:
+                    create_form.errors['__all__'] = [u'Error creating issue: %s' % e]
+
+            if create_form.is_valid():
+                GroupMeta.objects.set_value(group, '%s:tid' % prefix, issue_id)
+
+                issue_information = {
+                    'title': create_form.cleaned_data['title'],
+                    'provider': self.get_title(),
+                    'location': self.get_issue_url(group, issue_id),
+                    'label': self.get_issue_label(group=group, issue_id=issue_id),
+                }
+                Activity.objects.create(
+                    project=group.project,
                     group=group,
-                    form_data=form.cleaned_data,
-                    request=request,
+                    type=Activity.CREATE_ISSUE,
+                    user=request.user,
+                    data=issue_information,
                 )
-            except forms.ValidationError as e:
-                form.errors['__all__'] = [u'Error creating issue: %s' % e]
 
-        if form.is_valid():
-            GroupMeta.objects.set_value(group, '%s:tid' % prefix, issue_id)
+                issue_tracker_used.send(plugin=self, project=group.project, user=request.user, sender=IssueTrackingPlugin)
+                return self.redirect(group.get_absolute_url())
 
-            issue_information = {
-                'title': form.cleaned_data['title'],
-                'provider': self.get_title(),
-                'location': self.get_issue_url(group, issue_id),
-                'label': self.get_issue_label(group=group, issue_id=issue_id),
-            }
-            Activity.objects.create(
-                project=group.project,
-                group=group,
-                type=Activity.CREATE_ISSUE,
-                user=request.user,
-                data=issue_information,
-            )
+        elif op == 'link':
+            if link_form.is_valid():
+                issue_id = int(link_form.cleaned_data['issue_id'])
+                choices = link_form.fields['issue_id'].choices
+                issue_title = [title for num, title in choices if num == issue_id][0]
+                GroupMeta.objects.set_value(group, '%s:tid' % prefix, issue_id)
+                issue_information = {
+                    'title': issue_title,
+                    'provider': self.get_title(),
+                    'location': self.get_issue_url(group, issue_id),
+                    'label': self.get_issue_label(group=group, issue_id=issue_id),
+                }
+                Activity.objects.create(
+                    project=group.project,
+                    group=group,
+                    type=Activity.CREATE_ISSUE,
+                    user=request.user,
+                    data=issue_information,
+                )
 
-            issue_tracker_used.send(plugin=self, project=group.project, user=request.user, sender=IssueTrackingPlugin)
-            return self.redirect(group.get_absolute_url())
+                return self.redirect(group.get_absolute_url())
 
         context = {
-            'form': form,
+            'create_form': create_form,
             'title': self.get_new_issue_title(),
             'read_only_fields': self.get_new_issue_read_only_fields(group=group),
+            'can_link_existing_issues': self.can_link_existing_issues,
+            'link_form': link_form,
+            'op': op
         }
 
         return self.render(self.create_issue_template, context)
@@ -218,6 +267,8 @@ class IssueTrackingPlugin(Plugin):
         prefix = self.get_conf_key()
         if not GroupMeta.objects.get_value(group, '%s:tid' % prefix, None):
             action_list.append((self.get_new_issue_title(), self.get_url(group)))
+        elif self.can_unlink_issues:
+            action_list.append((self.get_unlink_issue_title(), self.get_url(group)))
         return action_list
 
     def tags(self, request, group, tag_list, **kwargs):
